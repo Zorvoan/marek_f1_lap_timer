@@ -75,7 +75,9 @@ runs (
   id uuid pk, route_id uuid fk, user_id uuid fk, session_id uuid,
   started_at timestamptz, total_ms int, split_times_ms int[],
   valid bool, verified bool default false, trace_path text,
-  countdown_s smallint, reaction_ms int, jump_start bool default false,  -- standing starts only
+  countdown_s smallint, reaction_ms int,                    -- standing starts only
+  jump_start bool default false, jump_distance_m real, penalty_ms int default 0,  -- +5000 on jump start
+  -- split_times_ms already includes penalty_ms; raw times = splits - penalty_ms
   gps_avg_accuracy_m real, gps_rate_hz real, created_at timestamptz
 )
 
@@ -118,13 +120,30 @@ if s_prev < boundary <= s_curr:
 - **Standing (countdown start)**:
   1. You stop within ~15 m of the start. The engine confirms you are stationary (speed < 1 km/h for 2 s), then enables the **Start countdown** button. This is the only tap during a run, and it happens while the car is stopped.
   2. A **countdown of 3–10 s** runs. You set its length on the pre-drive screen; the default is 5 s.
+     - The timing is **exact and even**: one beat per second with no random hold, so GO always comes exactly N seconds after the tap.
      - It shows as large numbers plus an F1-style row of lights, with a beep each second and a different tone on GO.
+     - The countdown runs on a monotonic clock. The GO instant is matched to the GPS time base, so the timer start lines up with the fix timestamps used for the gates.
   3. **The timer starts at GO**, not when the car moves, so your reaction time is part of the lap time. That is fair across all drivers, and the countdown length you choose doesn't affect the time.
-  4. **Jump start**: moving before GO marks the run as a jump start.
-     - Movement is detected by an **accelerometer** spike, or GPS speed above ~3 km/h as a fallback.
-     - A jump-start run is invalid. It is still saved and viewable, but it can't be a reference and isn't eligible for the leaderboard.
-     - The countdown can also be cancelled.
-  5. **Reaction time** is the time from GO to first motion (accelerometer). It is saved with the run and shown in the summary.
+  4. **Jump start: a +5 s penalty**, applied only when the car has really moved **more than 10 m forward before GO** (see 4.3.1). Smaller movements are ignored.
+     - The run keeps going. The HUD shows a **"JUMP START +5.0 s"** banner for a few seconds.
+     - The penalty is added to sector 1, so every split, delta, colour and the final time include it. A jump can never earn a purple sector or a better delta.
+     - Penalised runs are still **valid**. They count on the leaderboard with the penalty included and can be used as a reference.
+     - The countdown can also be cancelled before GO with no penalty.
+  5. **Reaction time** is the time from GO to first motion (accelerometer). It is saved with the run and shown in the summary. After a jump start it is shown as negative, e.g. "−0.4 s".
+
+#### 4.3.1 Jump-start detection without false penalties
+GPS **position** is the unreliable part. A phone sitting still often shows its position wandering 3–10 m (or more near buildings and trees). Comparing raw positions against a 10 m threshold would therefore produce false penalties. Instead, the engine estimates the distance moved before GO **from signals that don't drift**:
+
+1. **Anchor**: during the ≥2 s stationary check and the countdown, average the GPS fixes to get one stable start position. The accelerometer baseline (gravity and phone mount angle) is captured at the same time.
+2. **Is the car really moving?** Motion counts only when **both** of these agree:
+   - **Accelerometer**: sustained forward acceleration above ~0.1 g for more than 300 ms, after a low-pass filter. Engine revs, door slams and phone taps are short spikes and get filtered out.
+   - **GPS Doppler speed** (the fix's `speed` field) above ~1.5 m/s. Speed comes from the Doppler shift of the satellite signals, not from position differences, so it stays near zero while the car is stationary even when the reported position is wandering.
+3. **How far before GO?** Once motion is confirmed, the distance travelled up to GO is the **integral of Doppler speed over time**. Accelerometer data fills the gaps between 1 Hz fixes. Only movement **forward along the route** counts, so rolling back on a hill is never penalised.
+4. **Decision**: a penalty applies only if the integrated distance is **> 10 m**.
+   - **Cross-check**: if the GPS reports poor accuracy (> 15 m) during the countdown, motion must also be confirmed by the projected route position `s` being clearly ahead of the anchor once the fixes settle. If the signals still disagree, **no penalty is given**, because the driver gets the benefit of the doubt.
+5. **Server re-check**: the trace upload includes a short accelerometer log covering 10 s before GO to 5 s after it. `verify-run` repeats the same decision, so the phone and the server agree on penalties for leaderboard runs.
+
+The 10 m threshold is a setting in the engine (`JUMP_START_THRESHOLD_M`). Because the method doesn't rely on raw positions, it could be lowered later, e.g. to 3–5 m, without causing false penalties. Under the threshold, creeping a few metres gives a tiny head start, which is accepted as the cost of never penalising GPS noise.
 
 ### 4.4 Delta and colours (at each sector end k)
 ```
@@ -163,18 +182,18 @@ On loop routes, crossing the finish gate completes the lap and immediately start
    - Standing/rolling toggle, a name field, and Save.
 6. **Pre-drive setup**: choose the route, then the reference run. The run list shows date, total time and sector times, with your PB at the top. On a public route you can also choose the current leader. You also choose the screen mode (Full HUD or Delta-only). On standing-start routes you set the **countdown length (3–10 s)**, which is remembered per user.
 7. **Drive screen**: the screen stays awake and there are no controls to tap while moving (large Stop button only).
-   - **Standing start**: while you wait at the start line, a big **Start countdown** button appears once you are stopped there. It is followed by the full-screen countdown (numbers, lights and beeps) and GO. A jump start shows a red **JUMP START** screen.
+   - **Standing start**: while you wait at the start line, a big **Start countdown** button appears once you are stopped there. It is followed by the full-screen countdown (numbers, lights and beeps) and GO. A jump start shows a red **JUMP START +5.0 s** banner for a few seconds while the run continues.
    - **Full HUD**: running time, current delta (updated at each sector end), last sector time and its delta, sector k/N, distance to the next gate, and speed.
    - **Delta-only**: a huge `-0.42` / `+1.07`, with the full-screen background coloured yellow, green or purple by the last sector.
    - Both modes give haptic and sound cues at each gate. Optional voice callouts ("Sector 3, minus zero point four") let the driver keep their eyes on the road.
-8. **Run summary**: total time, reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard. Valid runs on public routes are queued for upload to the leaderboard.
+8. **Run summary**: total time (with any penalty shown separately, e.g. `1:42.310 (incl. +5.000 jump start)`), reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard. Valid runs on public routes are queued for upload to the leaderboard.
 9. **Run history**: all runs per route, with the option to delete runs.
 
 ---
 
 ## 6. Leaderboard integrity
 
-- A run only counts if it is `valid` (no off-route time, every gate crossed in order, acceptable GPS quality) **and** `verified`.
+- A run only counts if it is `valid` (no off-route time, every gate crossed in order, acceptable GPS quality) **and** `verified`. Jump-start penalties are included in the leaderboard time.
 - **Verification**: an Edge Function `verify-run` downloads the uploaded trace and replays it through the **same `packages/timing` engine**. If the times it computes match the times the phone reported (within tolerance), the run is marked `verified` and the leaderboard and sector records are updated.
 - Plausibility checks: maximum speed and acceleration limits, and a check that the GPS timestamps are monotonic and not too sparse.
 - This stops basic cheating, such as faking times in the request. A spoofed GPS trace is much harder to detect, so it is out of scope for v1.
@@ -216,7 +235,11 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 
 ---
 
-## 10. Open questions (need decisions)
+## 10. Decisions made
+- **Standing start**: countdown of 3–10 s (user-set), exact even timing with no random hold; the timer starts at GO.
+- **Jump start**: +5 s penalty, only for confirmed forward movement of more than 10 m before GO (section 4.3.1). The run stays valid.
+
+## 11. Open questions (need decisions)
 
 1. **Platforms**: iOS and Android both (assumed), or one first?
 2. **Green means faster than what?** Faster than the *selected reference* (assumed, per the brief), or faster than *your personal best* for that sector (the F1 convention)?
@@ -226,5 +249,3 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 6. **Can others save a public route** to their own list, or only drive it from the feed?
 7. **Positioning**: public roads or tracks/closed roads (see the safety risk above)?
 8. **Map provider**: is Mapbox OK, or do you prefer Google Maps?
-9. **Jump start**: invalidate the run (assumed), or add a time penalty, e.g. +5 s?
-10. **Countdown**: always the exact length you set, or end on a small random hold (like F1 lights out) so drivers can't anticipate GO?
