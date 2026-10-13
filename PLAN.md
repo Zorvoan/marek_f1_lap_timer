@@ -17,7 +17,9 @@ own earlier times, and competing with other drivers on routes they publish.
 | **Drive** | Pick a route and a previous run to race against (the reference), then drive. Times are taken from GPS crossings of the start, sector and finish gates. |
 | **Drive screens** | **Full HUD**: running time, delta, sector times, etc. **Delta-only**: the delta fills the screen, and the background colour shows how the last sector went (yellow/green/purple). |
 | **Delta logic** | The delta updates only when you **cross the end of a sector**: your elapsed time at that sector boundary minus the reference run's elapsed time at the same boundary. |
-| **Social** | Each creator can make **one** route public, and it gets a leaderboard. The feed is a map showing every public route. Tapping a route opens its leaderboard. |
+| **Social feed (home)** | Shows the **posted laps of everyone you follow**, newest at the top. Each card has the lap time, route, sectors and caption, plus quick **Compare** and **Race against** buttons. |
+| **Following** | Follow and unfollow anyone from their user page. Follower and following counts and lists are on every profile. |
+| **Routes map** | Each creator can make **one** route public, and it gets a leaderboard. The **Map** tab shows every public route, and tapping one opens its leaderboard. |
 | **Posting laps** | Laps are private by default. On a public route you can **post** a lap, which puts it on the route's leaderboard and on your user page. You can remove a post at any time. |
 | **Lap comparison** | Put any two laps side by side on the same route: your own laps, your lap against **another person's posted lap**, or against your theoretical best or the route record. It shows sector times, a delta graph, a speed graph and a map coloured by who was faster. |
 | **Users** | **User search** by username. **User pages** show a person's posted laps (with a PB per route), their public route and stats. From any posted lap you can **compare** with it or **race against it**. |
@@ -64,7 +66,7 @@ supabase/functions/     Edge functions (verify-run, leaderboard refresh)
 ### Roles and permissions
 | Role | How you get it | What it allows |
 |---|---|---|
-| `driver` | Every new account | Browse the feed map. Drive **public** routes, see your own runs and appear on leaderboards. |
+| `driver` | Every new account | Follow people, see the social feed, browse the routes map. Drive **public** routes, see your own runs and appear on leaderboards. |
 | `creator` | An **admin grants it** in the admin screen | Everything a driver can do, plus create private routes and publish **one** of them. |
 | `admin` | Set once **directly in the database** for your own account; it can't be granted from the app | Grant and revoke `creator`, review access requests, and hide or unpublish any public route. |
 
@@ -129,6 +131,16 @@ posts (
 lap_profiles (run_id uuid pk fk runs, step_m smallint default 10,
               elapsed_ms int[], speed_dms int[])   -- speed in 0.1 m/s
 
+-- following (one-way, no approval needed)
+follows (
+  follower_id uuid fk profiles, followee_id uuid fk profiles,
+  created_at timestamptz default now(),
+  primary key (follower_id, followee_id),
+  check (follower_id <> followee_id)
+)
+create index follows_followee_idx on follows(followee_id);       -- "followers of X"
+create index posts_user_created_idx on posts(user_id, created_at desc, id desc);  -- feed
+
 -- user search
 create extension if not exists pg_trgm;
 create index profiles_username_trgm on profiles using gin (username gin_trgm_ops);
@@ -158,6 +170,7 @@ public_laps          view: posts ⋈ runs, exposing only safe columns (times, sp
   - A post becomes visible once its run is `verified`. Until then it shows only to you, marked "verifying…".
   - **Delete**: by its owner, or by an admin for moderation.
 - **lap_profiles**: readable by the run's owner, or by anyone once the run is posted. They hold only time and speed against route distance, and the route is already public, so they reveal nothing beyond the lap itself.
+- **follows**: readable by everyone signed in, for follower and following lists. You can only insert or delete rows where `follower_id = auth.uid()`.
 - **profiles**: usernames and avatars are readable by everyone signed in, for search and user pages. Search goes through a `search_users(q)` function that is rate limited and returns at most 20 results.
 - Only the owner (and only while they are a creator) can insert or update their routes. Runs on public routes only reach the leaderboard after the server has **verified** them (section 6).
 
@@ -255,58 +268,88 @@ Two laps can be compared only on the **same route**, so they share the same froz
 
 **Racing against someone else's lap:** any posted lap on a route can be chosen as the **reference for a drive**. The live delta during the drive then compares you against that person's splits.
 
+### 4.7 Social feed
+- **Content**: every visible post (verified, on a public route that isn't hidden) by users **you follow**, newest first.
+- **Query**: the feed is built **when it is read**, which is simple and plenty fast at this scale.
+
+  ```sql
+  select ... from public_laps p
+  join follows f on f.followee_id = p.user_id and f.follower_id = auth.uid()
+  where (p.created_at, p.id) < (:cursor_created_at, :cursor_id)   -- keyset pagination
+  order by p.created_at desc, p.id desc
+  limit 20;
+  ```
+  - It is exposed as a `get_feed(cursor, limit)` database function and covered by `posts_user_created_idx`.
+  - **Keyset pagination**, rather than offset, keeps scrolling stable while new posts arrive.
+- **Freshness**: pull to refresh. While the app is open, Supabase Realtime watches for new posts from people you follow and shows a **"3 new laps ↑"** pill. Tapping it loads them at the top without jumping the scroll position.
+- **Consistency**:
+  - Unfollowing someone removes their posts from your feed immediately, because the feed is computed on read.
+  - Deleted, unposted and moderated posts disappear the same way.
+  - A post shows up once its lap is verified, ordered by its **post time**.
+- **Scaling later**: if the number of follows grows very large, switch to writing each post into followers' feeds at post time, using a `feed_items` table filled by a trigger. Not needed for v1.
+
 ---
 
 ## 5. Screens
 
 1. **Auth**: sign up or log in (email, Apple, Google), then choose a username. New accounts are **drivers**.
-2. **Social feed (home)**: a full-screen map.
+2. **Social feed (home)**: posted laps from people you follow, newest at the top, with infinite scroll and pull to refresh (see 4.7). Each card shows:
+   - avatar, username, and how long ago it was posted (tap to open their user page),
+   - route name with a small map thumbnail (tap to open the route leaderboard),
+   - a **big lap time**, a penalty badge if any, the leaderboard position when posted (e.g. **P3**) and a **New PB** badge when it beat their previous best,
+   - a strip of sector colours (purple for route records),
+   - caption and car,
+   - buttons: **Compare with my best** (only if you've driven that route), **Race against** and **Details** (opens Lap detail).
+
+   **Empty state** (not following anyone yet): a "Find drivers" button that opens search, plus suggested drivers such as leaders on public routes near you, with one-tap Follow buttons.
+3. **Routes map**: a full-screen map.
    - Zoomed out, public routes show as clustered start pins. Zoomed in, they show as coloured polylines.
    - Data loads by viewport through a PostGIS bounding-box query, using simplified geometry.
    - Tapping a route opens **Route detail**.
-3. **Route detail / leaderboard**: the route on a map, its length, sector count, start type and owner. Below that, a ranked list of each user's best **posted** lap, with the purple sector records. There is a "Drive this route" button.
+4. **Route detail / leaderboard**: the route on a map, its length, sector count, start type and owner. Below that, a ranked list of each user's best **posted** lap, with the purple sector records. There is a "Drive this route" button.
    - Tapping a username opens their **user page**.
    - Each row has **Compare with my best** and **Race against** buttons.
-4. **My routes**:
+5. **My routes**:
    - **Creators** see a list of their routes with thumbnails and personal bests. Each route has a "Make public" toggle.
      - If you already have a public route, turning on "Make public" for another one opens a dialog asking whether to replace it.
      - The dialog also warns that the start and end points become visible to everyone.
    - **Drivers** see the public routes they have driven and a **"Request creator access"** button (or "Request pending" once sent).
-5. **Route builder** (*creators only*; the server refuses saves from anyone else):
+6. **Route builder** (*creators only*; the server refuses saves from anyone else):
    - Tap waypoints on the map; they snap to roads through the Directions API.
    - You can drag waypoints and undo.
    - A **Loop** toggle closes the route.
    - A sector slider (50–1000 m) shows a live preview of the sector boundaries as tick marks on the route.
    - Standing/rolling toggle, a name field, and Save.
-6. **Pre-drive setup**: choose the route, then the reference lap. The list shows date, total time and sector times, with your PB at the top. On a public route you can also pick **any posted lap from another user**, such as the leader, a friend, or anyone found through search. You also choose the screen mode (Full HUD or Delta-only). On standing-start routes you set the **countdown length (3–10 s)**, which is remembered per user.
-7. **Drive screen**: the screen stays awake and there are no controls to tap while moving (large Stop button only).
+7. **Pre-drive setup**: choose the route, then the reference lap. The list shows date, total time and sector times, with your PB at the top. On a public route you can also pick **any posted lap from another user**, such as the leader, a friend, or anyone found through search. You also choose the screen mode (Full HUD or Delta-only). On standing-start routes you set the **countdown length (3–10 s)**, which is remembered per user.
+8. **Drive screen**: the screen stays awake and there are no controls to tap while moving (large Stop button only).
    - **Standing start**: while you wait at the start line, a big **Start countdown** button appears once you are stopped there. It is followed by the full-screen countdown (numbers, lights and beeps) and GO. A jump start shows a red **JUMP START +5.0 s** banner for a few seconds while the run continues.
    - **Full HUD**: running time, current delta (updated at each sector end), last sector time and its delta, sector k/N, distance to the next gate, and speed.
    - **Delta-only**: a huge `-0.42` / `+1.07`, with the full-screen background coloured yellow, green or purple by the last sector.
    - Both modes give haptic and sound cues at each gate. Optional voice callouts ("Sector 3, minus zero point four") let the driver keep their eyes on the road.
-8. **Run summary**: total time (with any penalty shown separately, e.g. `1:42.310 (incl. +5.000 jump start)`), reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard.
+9. **Run summary**: total time (with any penalty shown separately, e.g. `1:42.310 (incl. +5.000 jump start)`), reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard.
    - **Compare** opens the comparison against the reference lap you just raced.
    - **Post** appears on public routes for valid laps. It takes an optional caption and car, and the post goes live once the server verifies the lap.
-9. **Run history**: all runs per route, with the option to delete runs.
+10. **Run history**: all runs per route, with the option to delete runs.
    - Select any two laps to **compare** them.
    - Each lap shows a "Posted" badge, with Post and Unpost actions.
-10. **Admin panel** (*admins only*; hidden for everyone else):
+11. **Admin panel** (*admins only*; hidden for everyone else):
     - **Requests**: pending creator requests with the user's name and note, and Approve or Reject.
     - **Users**: search by username, see each user's role, and **grant or revoke creator** with one toggle.
     - **Public routes**: every published route, with Unpublish and Hide actions for moderation.
     - **Log**: who granted or revoked what, and when.
     - **Posts**: remove a post (moderation).
-11. **User search**: a search box with results as you type (username, partial match), showing avatar, username, a creator badge and the number of posted laps.
-12. **User page**:
+12. **User search**: a search box with results as you type (username, partial match), showing avatar, username, a creator badge, the number of posted laps and a **Follow** button.
+13. **User page**:
     - **Header**: avatar, username, a creator badge, member since, and stats (posted laps, routes driven, current #1 positions).
+    - **Follow / Following** button. **Followers** and **Following** counts; tapping them opens the lists, where each entry has its own Follow button.
     - **Their public route**: shown if they have one, with a link to its leaderboard.
     - **Posted laps**: grouped by route, with the PB per route at the top. Each entry shows time, date, leaderboard position, caption and car.
     - Tapping a lap opens **Lap detail**.
     - Your own page also has **Edit profile** (avatar, username) and lets you remove posts.
-13. **Lap detail**: one lap's sector table, delta and speed graph and map. It has **Compare with my best**, **Compare with…** (choose any lap on the route) and **Race against this**, which opens pre-drive with this lap as the reference.
-14. **Lap comparison**: the views described in 4.6. You can swap A and B, or change B to another lap.
+14. **Lap detail**: one lap's sector table, delta and speed graph and map. It has **Compare with my best**, **Compare with…** (choose any lap on the route) and **Race against this**, which opens pre-drive with this lap as the reference.
+15. **Lap comparison**: the views described in 4.6. You can swap A and B, or change B to another lap.
 
-**Navigation (bottom tabs):** Map (feed) · Search · My routes · Profile. Admins also get an Admin tab.
+**Navigation (bottom tabs):** Feed (home) · Map · Search · My routes · Profile. Admins also get an Admin tab.
 
 ---
 
@@ -328,7 +371,7 @@ Two laps can be compared only on the **same route**, so they share the same froz
 | **1: Timing engine** | `packages/timing` with projection, windowing, interpolation, starts, sectors, laps, delta and colours. Unit tests run against synthetic traces and the recorded fixtures. | Gate crossing error below ~0.2 s on fixtures. Loop and self-crossing routes handled. |
 | **2: Accounts, roles and routes** | Auth, **roles** (`user_roles`, RLS helpers, bootstrap admin), **admin panel** (grant/revoke, requests, audit log), the route builder with road snapping, sector preview, loop/start options, and My routes. | Only users the admin has approved can create routes; a direct API insert from a driver is rejected (covered by a test). Creators' routes are private. |
 | **3: Drive (MVP)** | Pre-drive reference picker, both drive screens, cues, run summary, offline save and later sync, and **comparing your own laps** (sector table, delta and speed graphs from on-device lap profiles). A **GPS replay mode** plays a recorded trace into the app so drives can be tested at a desk. | A full drive works end to end on a real road, with deltas at each sector. **← First usable version** |
-| **4: Social** | Publish one route (creators), admin moderation of public routes and posts, verify-run function, **posting laps**, leaderboard, sector records (purple), feed map with clustering, route detail, **user search**, **user pages**, **lap detail**, **comparing with and racing against other people's laps**. | Two users can compete on a public route. A user can find another by search, open their page, compare with their posted lap and race against it. |
+| **4: Social** | Publish one route (creators), admin moderation of public routes and posts, verify-run function, **posting laps**, leaderboard, sector records (purple), routes map with clustering, route detail, **user search**, **user pages**, **following**, **social feed** (cursor pagination, new-posts pill), **lap detail**, **comparing with and racing against other people's laps**. | Two users can compete on a public route. A user can find another by search, open their page, compare with their posted lap and race against it. After following someone, their new posts appear at the top of the feed. |
 | **5: Polish** | Voice callouts, profiles and avatars, sharing a run as an image, external BLE GPS support, Hermite interpolation, battery tuning. | Ready for app store submission. |
 
 ---
@@ -348,7 +391,9 @@ Two laps can be compared only on the **same route**, so they share the same froz
 
 ## 9. Later ideas (not in v1)
 - Live "ghost" delta between sectors, interpolated from the reference trace.
-- Following other users, and a social feed of runs.
+- Push notifications: a followed user posts, someone follows you, someone beats your time on a route.
+- Likes and comments on posts.
+- Blocking users and private profiles where follows need approval.
 - Car profiles (compare times by car class).
 - External 10–25 Hz GNSS receivers over BLE.
 - Video overlay export (time and delta burned into dashcam footage).
@@ -361,6 +406,7 @@ Two laps can be compared only on the **same route**, so they share the same froz
 - **Route creation needs permission**: only users the admin approves (role `creator`) can create and publish routes. Everyone else is a driver who drives public routes. The admin role is set in the database, not from the app.
 
 - **Lap comparison**: any two laps on the same route, either your own or against other people's posted laps (section 4.6). Any posted lap can be used as a drive reference.
+- **Following and social feed**: one-way follows with no approval. The home tab is a feed of posted laps from people you follow, newest first. The routes map moves to its own tab.
 - **Posting and users**: laps are private until posted. Posting is only possible on public routes. There is user search and there are user pages showing posted laps.
 
 ## 11. Open questions (need decisions)
@@ -377,4 +423,4 @@ Two laps can be compared only on the **same route**, so they share the same froz
 10. **Access requests**: should drivers be able to request creator access in the app (assumed), or should you only grant it yourself, e.g. to people you know?
 11. **Leaderboard and posting**: should the leaderboard show only **posted** laps (assumed, so nothing appears publicly without your choice), or automatically include every verified lap on a public route?
 12. **Posts per route**: can a user post many laps on one route (assumed: yes, with the leaderboard taking their best), or only one, so a new post replaces the old one?
-13. **Following**: should users be able to follow each other, with a feed of new posts from people they follow? It isn't in the plan yet and would fit in phase 5.
+13. **Your own posts in the feed**: should your own posted laps also appear in your feed, or only followed users' (assumed, per the brief)?
