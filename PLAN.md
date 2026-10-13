@@ -24,7 +24,7 @@ own earlier times, and competing with other drivers on routes they publish.
 |---|---|---|
 | Mobile app | **React Native + Expo** (TypeScript) | One codebase for iOS and Android. Expo dev builds still allow native modules for GPS and maps. |
 | Maps | **Mapbox** (`@rnmapbox/maps`) | Good custom styling for a dark "racing" look. Includes the Directions and Map Matching APIs, which snap routes to roads, and a generous free tier. |
-| Location | `expo-location` (foreground plus background while a run is active), `expo-sensors` (accelerometer) | GPS fixes for timing. The accelerometer detects the launch on standing starts. |
+| Location | `expo-location` (foreground plus background while a run is active), `expo-sensors` (accelerometer) | GPS fixes for timing. On standing starts, the accelerometer catches a jump start and measures reaction time. |
 | Local storage | SQLite (`expo-sqlite`) | Works **offline**: routes, references and finished runs are stored on the device, so driving works without signal (mountain roads). |
 | Backend | **Supabase**: Postgres + **PostGIS**, Auth, Storage, Edge Functions | Row-level security covers "only I see my routes". PostGIS handles map viewport queries. Edge Functions run TypeScript (Deno). |
 | Shared code | `packages/timing`: a pure TypeScript timing engine | The **same code** runs on the phone during the drive and on the server to verify leaderboard runs. |
@@ -75,6 +75,7 @@ runs (
   id uuid pk, route_id uuid fk, user_id uuid fk, session_id uuid,
   started_at timestamptz, total_ms int, split_times_ms int[],
   valid bool, verified bool default false, trace_path text,
+  countdown_s smallint, reaction_ms int, jump_start bool default false,  -- standing starts only
   gps_avg_accuracy_m real, gps_rate_hz real, created_at timestamptz
 )
 
@@ -114,7 +115,16 @@ if s_prev < boundary <= s_curr:
 
 ### 4.3 Starts
 - **Rolling**: the timer arms when you are within ~50 m of the start and heading in the route's direction. It starts when you cross the start gate, which is a line perpendicular to the route at its first point, using the same interpolation.
-- **Standing**: the timer arms when you are stopped (speed < 1 km/h for 2 s) within ~15 m of the start. It starts at the first motion, timestamped by an **accelerometer** spike so it is not delayed by the 1 Hz GPS. If there is no accelerometer signal, the engine falls back to GPS speed rising above ~3 km/h.
+- **Standing (countdown start)**:
+  1. You stop within ~15 m of the start. The engine confirms you are stationary (speed < 1 km/h for 2 s), then enables the **Start countdown** button. This is the only tap during a run, and it happens while the car is stopped.
+  2. A **countdown of 3–10 s** runs. You set its length on the pre-drive screen; the default is 5 s.
+     - It shows as large numbers plus an F1-style row of lights, with a beep each second and a different tone on GO.
+  3. **The timer starts at GO**, not when the car moves, so your reaction time is part of the lap time. That is fair across all drivers, and the countdown length you choose doesn't affect the time.
+  4. **Jump start**: moving before GO marks the run as a jump start.
+     - Movement is detected by an **accelerometer** spike, or GPS speed above ~3 km/h as a fallback.
+     - A jump-start run is invalid. It is still saved and viewable, but it can't be a reference and isn't eligible for the leaderboard.
+     - The countdown can also be cancelled.
+  5. **Reaction time** is the time from GO to first motion (accelerometer). It is saved with the run and shown in the summary.
 
 ### 4.4 Delta and colours (at each sector end k)
 ```
@@ -151,12 +161,13 @@ On loop routes, crossing the finish gate completes the lap and immediately start
    - A **Loop** toggle closes the route.
    - A sector slider (50–1000 m) shows a live preview of the sector boundaries as tick marks on the route.
    - Standing/rolling toggle, a name field, and Save.
-6. **Pre-drive setup**: choose the route, then the reference run. The run list shows date, total time and sector times, with your PB at the top. On a public route you can also choose the current leader. You also choose the screen mode (Full HUD or Delta-only).
+6. **Pre-drive setup**: choose the route, then the reference run. The run list shows date, total time and sector times, with your PB at the top. On a public route you can also choose the current leader. You also choose the screen mode (Full HUD or Delta-only). On standing-start routes you set the **countdown length (3–10 s)**, which is remembered per user.
 7. **Drive screen**: the screen stays awake and there are no controls to tap while moving (large Stop button only).
+   - **Standing start**: while you wait at the start line, a big **Start countdown** button appears once you are stopped there. It is followed by the full-screen countdown (numbers, lights and beeps) and GO. A jump start shows a red **JUMP START** screen.
    - **Full HUD**: running time, current delta (updated at each sector end), last sector time and its delta, sector k/N, distance to the next gate, and speed.
    - **Delta-only**: a huge `-0.42` / `+1.07`, with the full-screen background coloured yellow, green or purple by the last sector.
    - Both modes give haptic and sound cues at each gate. Optional voice callouts ("Sector 3, minus zero point four") let the driver keep their eyes on the road.
-8. **Run summary**: total time, a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard. Valid runs on public routes are queued for upload to the leaderboard.
+8. **Run summary**: total time, reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard. Valid runs on public routes are queued for upload to the leaderboard.
 9. **Run history**: all runs per route, with the option to delete runs.
 
 ---
@@ -215,3 +226,5 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 6. **Can others save a public route** to their own list, or only drive it from the feed?
 7. **Positioning**: public roads or tracks/closed roads (see the safety risk above)?
 8. **Map provider**: is Mapbox OK, or do you prefer Google Maps?
+9. **Jump start**: invalidate the run (assumed), or add a time penalty, e.g. +5 s?
+10. **Countdown**: always the exact length you set, or end on a small random hold (like F1 lights out) so drivers can't anticipate GO?
