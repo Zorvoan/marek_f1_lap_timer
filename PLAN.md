@@ -3,18 +3,21 @@
 A mobile app for timing drives on routes you define yourself, racing against your
 own earlier times, and competing with other drivers on routes they publish.
 
+**Only approved users can create routes.** An admin grants that permission from an admin account. Everyone else can still drive public routes and appear on their leaderboards.
+
 ---
 
 ## 1. Feature summary
 
 | Area | What it does |
 |---|---|
-| **Route builder** | Draw a route on a map, snapped to roads. It can be point-to-point or a **lap** (loop, where start = finish). Choose a **sector length** (50–1000 m) and a **standing** or **rolling** start. |
-| **My routes** | Each user's routes are private. Only the owner can see them, except for the one public route described below. |
+| **Roles and permissions** | Three roles. A **driver** (every new account) can drive public routes, race their own times and appear on leaderboards. A **creator** can also create routes; an admin grants this. An **admin** grants and revokes creator access and can moderate public routes. |
+| **Route builder** | *Creators only.* Draw a route on a map, snapped to roads. It can be point-to-point or a **lap** (loop, where start = finish). Choose a **sector length** (50–1000 m) and a **standing** or **rolling** start. |
+| **My routes** | Each creator's routes are private. Only the owner can see them, except for the one public route described below. Drivers see the public routes they have driven. |
 | **Drive** | Pick a route and a previous run to race against (the reference), then drive. Times are taken from GPS crossings of the start, sector and finish gates. |
 | **Drive screens** | **Full HUD**: running time, delta, sector times, etc. **Delta-only**: the delta fills the screen, and the background colour shows how the last sector went (yellow/green/purple). |
 | **Delta logic** | The delta updates only when you **cross the end of a sector**: your elapsed time at that sector boundary minus the reference run's elapsed time at the same boundary. |
-| **Social** | Each user can make **one** route public, and it gets a leaderboard. The feed is a map showing every public route. Tapping a route opens its leaderboard. |
+| **Social** | Each creator can make **one** route public, and it gets a leaderboard. The feed is a map showing every public route. Tapping a route opens its leaderboard. |
 
 ---
 
@@ -55,17 +58,47 @@ supabase/functions/     Edge functions (verify-run, leaderboard refresh)
 - `total_ms`, a `valid` flag, GPS quality stats, and the raw GPS trace (kept in Storage and used for verification and replay).
 - On loop routes, each lap is its own run, and runs from the same session share a `session_id`.
 
+### Roles and permissions
+| Role | How you get it | What it allows |
+|---|---|---|
+| `driver` | Every new account | Browse the feed map. Drive **public** routes, see your own runs and appear on leaderboards. |
+| `creator` | An **admin grants it** in the admin screen | Everything a driver can do, plus create private routes and publish **one** of them. |
+| `admin` | Set once **directly in the database** for your own account; it can't be granted from the app | Grant and revoke `creator`, review access requests, and hide or unpublish any public route. |
+
+- **The server enforces everything**, not just the app UI.
+  - Database policies (RLS) refuse a route insert from anyone who isn't a creator, even if someone calls the API directly.
+  - Hiding the route builder button is only a convenience.
+- **Users can never change their own role.** Roles live in a separate `user_roles` table that only admins can write to, not in `profiles`, where users can edit their own row.
+- **Revoking creator access**:
+  - The user can no longer create new routes or publish.
+  - Their existing routes and runs stay, so other people's leaderboard times are not lost.
+  - The admin can separately unpublish or hide their public route.
+- **Requesting access**: a driver can tap "Request creator access" and add an optional note. The admin sees pending requests in the admin screen and approves or rejects each one. Every grant and revoke is logged.
+- **More admins**: only the bootstrap admin (you) exists at first. Making someone else an admin is also a database operation, which keeps it deliberate.
+
 ### Schema sketch
 
 ```sql
 profiles (id uuid pk = auth.uid, username text unique, avatar_url, created_at)
+
+-- roles: writable ONLY by admins (RLS); a user may read their own row
+user_roles (user_id uuid pk fk profiles, role text check (role in ('creator','admin')),
+            granted_by uuid fk profiles, granted_at timestamptz)   -- no row = plain driver
+creator_requests (id uuid pk, user_id uuid fk, note text, status text check (status in ('pending','approved','rejected')),
+                  decided_by uuid, decided_at timestamptz, created_at timestamptz)
+role_audit_log (id bigserial pk, actor_id uuid, target_user_id uuid, action text, created_at timestamptz)
+
+-- helpers used by RLS policies (security definer, stable):
+--   is_admin()   := exists(select 1 from user_roles where user_id = auth.uid() and role = 'admin')
+--   can_create() := exists(select 1 from user_roles where user_id = auth.uid() and role in ('creator','admin'))
 
 routes (
   id uuid pk, owner_id uuid fk profiles,
   name text, geometry geography(LineString), length_m numeric,
   is_loop bool, sector_length_m int check (sector_length_m between 50 and 1000),
   sector_boundaries_m numeric[], start_type text check (start_type in ('standing','rolling')),
-  is_public bool default false, published_at timestamptz, created_at timestamptz
+  is_public bool default false, published_at timestamptz, created_at timestamptz,
+  hidden_by_admin bool default false   -- moderation: hidden routes vanish from feed/leaderboards
 )
 -- only ONE public route per user:
 create unique index one_public_route_per_user on routes(owner_id) where is_public;
@@ -87,9 +120,18 @@ leaderboard          (route_id, user_id, best_run_id, best_total_ms, rank)     -
 ```
 
 ### Who can see what (RLS)
-- **routes**: the owner can see their own routes. Anyone signed in can **read** routes where `is_public`.
+- **routes**:
+  - The owner can see their own routes.
+  - Anyone signed in can **read** routes where `is_public and not hidden_by_admin`.
+  - **Insert** requires `owner_id = auth.uid() and can_create()`.
+  - Setting `is_public = true` also requires `can_create()`.
+  - Admins can update `is_public` and `hidden_by_admin` on any route.
+- **user_roles / creator_requests / role_audit_log**:
+  - Admins can read and write everything.
+  - Users can read their own role and their own requests, and can insert a request for themselves.
+  - Grants go through a single `set_user_role(target, role | null)` database function that checks `is_admin()` and writes the audit log in the same transaction.
 - **runs**: a user can see all of their own runs. On public routes, other users can see only the **times** (leaderboard and sector records), never the raw traces. A trace can reveal where someone lives.
-- Only the owner can insert or update their routes. Runs on public routes only reach the leaderboard after the server has **verified** them (section 6).
+- Only the owner (and only while they are a creator) can insert or update their routes. Runs on public routes only reach the leaderboard after the server has **verified** them (section 6).
 
 ---
 
@@ -165,16 +207,18 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 
 ## 5. Screens
 
-1. **Auth**: sign up or log in (email, Apple, Google), then choose a username.
+1. **Auth**: sign up or log in (email, Apple, Google), then choose a username. New accounts are **drivers**.
 2. **Social feed (home)**: a full-screen map.
    - Zoomed out, public routes show as clustered start pins. Zoomed in, they show as coloured polylines.
    - Data loads by viewport through a PostGIS bounding-box query, using simplified geometry.
    - Tapping a route opens **Route detail**.
 3. **Route detail / leaderboard**: the route on a map, its length, sector count, start type and owner. Below that, a ranked list of each user's best time, with the purple sector records. There is a "Drive this route" button.
-4. **My routes**: a list of your routes with thumbnails and personal bests. Each route has a "Make public" toggle.
-   - If you already have a public route, a dialog asks whether to replace it.
-   - The dialog also warns that the start and end points become visible to everyone.
-5. **Route builder**:
+4. **My routes**:
+   - **Creators** see a list of their routes with thumbnails and personal bests. Each route has a "Make public" toggle.
+     - If you already have a public route, turning on "Make public" for another one opens a dialog asking whether to replace it.
+     - The dialog also warns that the start and end points become visible to everyone.
+   - **Drivers** see the public routes they have driven and a **"Request creator access"** button (or "Request pending" once sent).
+5. **Route builder** (*creators only*; the server refuses saves from anyone else):
    - Tap waypoints on the map; they snap to roads through the Directions API.
    - You can drag waypoints and undo.
    - A **Loop** toggle closes the route.
@@ -188,6 +232,11 @@ On loop routes, crossing the finish gate completes the lap and immediately start
    - Both modes give haptic and sound cues at each gate. Optional voice callouts ("Sector 3, minus zero point four") let the driver keep their eyes on the road.
 8. **Run summary**: total time (with any penalty shown separately, e.g. `1:42.310 (incl. +5.000 jump start)`), reaction time (standing starts), a table of sector times coloured like the HUD, the trace on the map coloured by sector, and Save or Discard. Valid runs on public routes are queued for upload to the leaderboard.
 9. **Run history**: all runs per route, with the option to delete runs.
+10. **Admin panel** (*admins only*; hidden for everyone else):
+    - **Requests**: pending creator requests with the user's name and note, and Approve or Reject.
+    - **Users**: search by username, see each user's role, and **grant or revoke creator** with one toggle.
+    - **Public routes**: every published route, with Unpublish and Hide actions for moderation.
+    - **Log**: who granted or revoked what, and when.
 
 ---
 
@@ -206,9 +255,9 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 |---|---|---|
 | **0: Foundations and spikes** | Monorepo, Expo app, Supabase project. **Device GPS spike**: log real update rates and accuracy on a few iOS and Android phones while driving. | Recorded GPS traces saved as test fixtures. Confirmed which update rates are realistic. |
 | **1: Timing engine** | `packages/timing` with projection, windowing, interpolation, starts, sectors, laps, delta and colours. Unit tests run against synthetic traces and the recorded fixtures. | Gate crossing error below ~0.2 s on fixtures. Loop and self-crossing routes handled. |
-| **2: Routes (private)** | Auth, route builder with road snapping, sector preview, loop/start options, My routes, RLS. | A user can create, save and list routes that nobody else can see. |
+| **2: Accounts, roles and routes** | Auth, **roles** (`user_roles`, RLS helpers, bootstrap admin), **admin panel** (grant/revoke, requests, audit log), the route builder with road snapping, sector preview, loop/start options, and My routes. | Only users the admin has approved can create routes; a direct API insert from a driver is rejected (covered by a test). Creators' routes are private. |
 | **3: Drive (MVP)** | Pre-drive reference picker, both drive screens, cues, run summary, offline save and later sync. A **GPS replay mode** plays a recorded trace into the app so drives can be tested at a desk. | A full drive works end to end on a real road, with deltas at each sector. **← First usable version** |
-| **4: Social** | Publish one route, verify-run function, leaderboard, sector records (purple), feed map with clustering, route detail. | Two users can compete on a public route, and the feed map shows it. |
+| **4: Social** | Publish one route (creators), admin moderation of public routes, verify-run function, leaderboard, sector records (purple), feed map with clustering, route detail. | Two users can compete on a public route, and the feed map shows it. |
 | **5: Polish** | Voice callouts, profiles and avatars, sharing a run as an image, external BLE GPS support, Hermite interpolation, battery tuning. | Ready for app store submission. |
 
 ---
@@ -239,6 +288,8 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 - **Standing start**: countdown of 3–10 s (user-set), exact even timing with no random hold; the timer starts at GO.
 - **Jump start**: +5 s penalty, only for confirmed forward movement of more than 10 m before GO (section 4.3.1). The run stays valid.
 
+- **Route creation needs permission**: only users the admin approves (role `creator`) can create and publish routes. Everyone else is a driver who drives public routes. The admin role is set in the database, not from the app.
+
 ## 11. Open questions (need decisions)
 
 1. **Platforms**: iOS and Android both (assumed), or one first?
@@ -249,3 +300,5 @@ On loop routes, crossing the finish gate completes the lap and immediately start
 6. **Can others save a public route** to their own list, or only drive it from the feed?
 7. **Positioning**: public roads or tracks/closed roads (see the safety risk above)?
 8. **Map provider**: is Mapbox OK, or do you prefer Google Maps?
+9. **Scope of the permission**: should approval be needed to create **any** route (assumed), or only to **publish** one? With the second option, everyone could build private routes and only approved users could make one public.
+10. **Access requests**: should drivers be able to request creator access in the app (assumed), or should you only grant it yourself, e.g. to people you know?
